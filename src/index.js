@@ -45,10 +45,14 @@ app.post("/ryver", async (req, res) => {
     // Ryver's outgoing webhook payload shape can vary by trigger type.
     // Pull the message text defensively.
     const body = req.body || {};
+    // TEMP: dump the raw payload so we can see exactly where Ryver puts the text.
+    console.log("[ryver] RAW PAYLOAD: " + JSON.stringify(body));
     const question =
       body.message ||
       body.text ||
       (body.data && (body.data.message || body.data.text)) ||
+      (body.data && body.data.body) ||
+      body.body ||
       "";
 
     if (!question.trim()) {
