@@ -1,0 +1,20 @@
+{
+  "name": "ryver-handbook-bot",
+  "version": "1.0.0",
+  "description": "Ryver Q&A bot that answers questions from the employee handbook in a Google Shared Drive",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0",
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
