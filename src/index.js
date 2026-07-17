@@ -48,12 +48,25 @@ app.post("/ryver", async (req, res) => {
     // TEMP: dump the raw payload so we can see exactly where Ryver puts the text.
     console.log("[ryver] RAW PAYLOAD: " + JSON.stringify(body));
     const question =
+      (body.data && body.data.entity && body.data.entity.message) ||
       body.message ||
       body.text ||
       (body.data && (body.data.message || body.data.text)) ||
       (body.data && body.data.body) ||
       body.body ||
       "";
+
+    // Ignore messages the bot itself posted, or we'll loop forever
+    // (bot answers -> that answer fires this webhook -> bot answers again).
+    const senderName =
+      (body.user && body.user.__descriptor) ||
+      (body.data && body.data.entity && body.data.entity.__createUser) ||
+      "";
+    const botName = process.env.BOT_DISPLAY_NAME || "Digby";
+    if (senderName && botName && senderName.toLowerCase() === botName.toLowerCase()) {
+      console.log(`[ryver] Ignoring message from the bot itself (${senderName}).`);
+      return;
+    }
 
     if (!question.trim()) {
       console.log("[ryver] No message text found in payload; skipping.");
