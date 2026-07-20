@@ -13,6 +13,25 @@ app.use(express.json());
 const CACHE_TTL = Number(process.env.CACHE_TTL_MS || 30 * 60 * 1000); // 30 min
 let cache = { chunks: null, text: null, name: null, fetchedAt: 0 };
 
+// --- Duplicate-message guard --------------------------------------------
+// Ryver retries the outbound webhook if the bot is slow to respond (the
+// conflict scan takes several seconds), and each retry would re-run the
+// whole request. We remember message IDs we've already started handling
+// and ignore repeats. Bounded so it can't grow forever.
+const seenMessageIds = new Set();
+const SEEN_MAX = 500;
+function alreadyHandled(id) {
+  if (!id) return false;
+  if (seenMessageIds.has(id)) return true;
+  seenMessageIds.add(id);
+  // Trim oldest entries when the set gets too big.
+  if (seenMessageIds.size > SEEN_MAX) {
+    const oldest = seenMessageIds.values().next().value;
+    seenMessageIds.delete(oldest);
+  }
+  return false;
+}
+
 async function getChunks() {
   const now = Date.now();
   if (cache.chunks && now - cache.fetchedAt < CACHE_TTL) {
@@ -56,6 +75,15 @@ app.post("/ryver", async (req, res) => {
       (body.data && body.data.body) ||
       body.body ||
       "";
+
+    // Drop duplicate deliveries (Ryver retries slow requests). Keyed on the
+    // message's unique id so a retry of the SAME message is ignored.
+    const messageId =
+      (body.data && body.data.entity && body.data.entity.id) || "";
+    if (alreadyHandled(messageId)) {
+      console.log(`[ryver] Duplicate delivery of message ${messageId}; ignoring.`);
+      return;
+    }
 
     // Ignore messages the bot itself posted, or we'll loop forever
     // (bot posts -> that post fires this webhook -> bot responds again).
