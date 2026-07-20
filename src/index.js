@@ -2,6 +2,7 @@ import express from "express";
 import { getHandbookText } from "./drive.js";
 import { chunkText, retrieve } from "./retrieve.js";
 import { answerFromHandbook } from "./answer.js";
+import { scanForConflicts } from "./conflicts.js";
 
 const app = express();
 app.use(express.json());
@@ -10,7 +11,7 @@ app.use(express.json());
 // Re-fetch from Drive at most every CACHE_TTL ms so we're not downloading
 // the file on every single message, but still pick up edits within the day.
 const CACHE_TTL = Number(process.env.CACHE_TTL_MS || 30 * 60 * 1000); // 30 min
-let cache = { chunks: null, name: null, fetchedAt: 0 };
+let cache = { chunks: null, text: null, name: null, fetchedAt: 0 };
 
 async function getChunks() {
   const now = Date.now();
@@ -19,7 +20,7 @@ async function getChunks() {
   }
   const { name, text } = await getHandbookText();
   const chunks = chunkText(text);
-  cache = { chunks, name, fetchedAt: now };
+  cache = { chunks, text, name, fetchedAt: now };
   console.log(`[cache] Loaded "${name}" -> ${chunks.length} chunks`);
   return cache;
 }
@@ -75,8 +76,47 @@ app.post("/ryver", async (req, res) => {
 
     // Strip a leading @botname mention if present.
     const cleaned = question.replace(/^@\S+\s*/, "").trim();
-    console.log(`[ryver] Question: ${cleaned}`);
+    console.log(`[ryver] Message: ${cleaned}`);
 
+    // --- Intent detection ------------------------------------------------
+    // Conflict scan: a deliberate maintenance operation, not an everyday
+    // question. Triggered by phrases like "scan for conflicts", "check the
+    // handbook for conflicts", "find contradictions".
+    const isConflictScan =
+      /\b(conflict|contradict|inconsisten|discrepan)/i.test(cleaned) &&
+      /\b(scan|check|find|review|look)/i.test(cleaned);
+
+    if (isConflictScan) {
+      // Gate behind an allowlist of Ryver user IDs (maintenance tool, not
+      // for every employee). Set HANDBOOK_ADMIN_IDS in Railway to a
+      // comma-separated list of Ryver numeric user IDs (Kevin, Josh, Joe).
+      // NOTE: while HANDBOOK_ADMIN_IDS is empty, the scan is open to anyone
+      // so it can be tested — LOCK THIS DOWN before widening access.
+      const allowRaw = (process.env.HANDBOOK_ADMIN_IDS || "").trim();
+      const allowlist = allowRaw ? allowRaw.split(",").map((s) => s.trim()) : [];
+      const senderId = String(
+        (body.user && body.user.id) ||
+          (body.data && body.data.entity && body.data.entity.__author) ||
+          ""
+      );
+
+      if (allowlist.length > 0 && !allowlist.includes(senderId)) {
+        console.log(`[ryver] Conflict scan denied for user id ${senderId}.`);
+        await postToRyver(
+          "Sorry — the conflict scan is limited to handbook admins (Kevin, Josh, or Joe)."
+        );
+        return;
+      }
+
+      console.log(`[ryver] Running conflict scan (requested by id ${senderId}).`);
+      await postToRyver("Scanning the handbook for conflicts — give me a moment...");
+      const { text } = await getChunks();
+      const report = await scanForConflicts(text);
+      await postToRyver(report);
+      return;
+    }
+
+    // --- Default: answer the question ------------------------------------
     const { chunks } = await getChunks();
     const top = retrieve(cleaned, chunks, 4);
     const answer = await answerFromHandbook(cleaned, top);
