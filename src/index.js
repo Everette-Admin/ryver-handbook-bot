@@ -82,4 +82,77 @@ app.post("/ryver", async (req, res) => {
     // question. Trigger on a conflict word combined with EITHER an action
     // verb ("scan/check/find for conflicts") OR a reference to the handbook
     // as a whole ("any conflicts in the handbook?").
-    const mentionsConflict =
+    const mentionsConflict = /\b(conflict|contradict|inconsisten|discrepan)/i.test(cleaned);
+    const hasActionVerb = /\b(scan|check|find|review|look|audit)\b/i.test(cleaned);
+    const refersToWholeDoc = /\b(handbook|document|policies|whole|entire|anywhere)\b/i.test(cleaned);
+    // Avoid false-positives where "conflict" is the topic of a normal policy
+    // question (e.g. "what's the conflict resolution policy?").
+    const isPolicyQuestion = /\bconflict resolution\b/i.test(cleaned);
+    const isConflictScan =
+      mentionsConflict && !isPolicyQuestion && (hasActionVerb || refersToWholeDoc);
+
+    if (isConflictScan) {
+      // Gate behind an allowlist of Ryver user IDs (maintenance tool, not
+      // for every employee). Set HANDBOOK_ADMIN_IDS in Railway to a
+      // comma-separated list of Ryver numeric user IDs (Kevin, Josh, Joe).
+      // NOTE: while HANDBOOK_ADMIN_IDS is empty, the scan is open to anyone
+      // so it can be tested — LOCK THIS DOWN before widening access.
+      const allowRaw = (process.env.HANDBOOK_ADMIN_IDS || "").trim();
+      const allowlist = allowRaw ? allowRaw.split(",").map((s) => s.trim()) : [];
+      const senderId = String(
+        (body.user && body.user.id) ||
+          (body.data && body.data.entity && body.data.entity.__author) ||
+          ""
+      );
+
+      if (allowlist.length > 0 && !allowlist.includes(senderId)) {
+        console.log(`[ryver] Conflict scan denied for user id ${senderId}.`);
+        await postToRyver(
+          "Sorry — the conflict scan is limited to handbook admins (Kevin, Josh, or Joe)."
+        );
+        return;
+      }
+
+      console.log(`[ryver] Running conflict scan (requested by id ${senderId}).`);
+      await postToRyver("Scanning the handbook for conflicts — give me a moment...");
+      const { text } = await getChunks();
+      const report = await scanForConflicts(text);
+      await postToRyver(report);
+      return;
+    }
+
+    // --- Default: answer the question ------------------------------------
+    const { chunks } = await getChunks();
+    const top = retrieve(cleaned, chunks, 4);
+    const answer = await answerFromHandbook(cleaned, top);
+
+    await postToRyver(answer);
+  } catch (err) {
+    console.error("[ryver] Error handling message:", err);
+    await postToRyver(
+      "Something went wrong reaching the handbook. Ping Everette if this keeps happening."
+    ).catch(() => {});
+  }
+});
+
+// --- Post a reply back into Ryver --------------------------------------
+// Uses an INCOMING webhook URL (created in Ryver, points at a specific
+// channel/forum). Set RYVER_INBOUND_URL to that URL.
+async function postToRyver(text) {
+  const url = process.env.RYVER_INBOUND_URL;
+  if (!url) {
+    console.warn("[ryver] RYVER_INBOUND_URL not set; would have posted:\n" + text);
+    return;
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body: text }),
+  });
+  if (!resp.ok) {
+    console.error(`[ryver] Inbound post failed: ${resp.status} ${await resp.text()}`);
+  }
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
