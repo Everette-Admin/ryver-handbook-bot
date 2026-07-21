@@ -65,6 +65,8 @@ app.post("/ryver", async (req, res) => {
     // Ryver's outgoing webhook payload shape can vary by trigger type.
     // Pull the message text defensively.
     const body = req.body || {};
+    // TEMP: dump the raw payload so we can see how Ryver encodes mentions.
+    console.log("[ryver] RAW PAYLOAD: " + JSON.stringify(body));
     const question =
       (body.data && body.data.entity && body.data.entity.message) ||
       body.message ||
