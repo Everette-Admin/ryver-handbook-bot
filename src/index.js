@@ -65,8 +65,6 @@ app.post("/ryver", async (req, res) => {
     // Ryver's outgoing webhook payload shape can vary by trigger type.
     // Pull the message text defensively.
     const body = req.body || {};
-    // TEMP: dump the raw payload so we can see exactly where Ryver puts the text.
-    console.log("[ryver] RAW PAYLOAD: " + JSON.stringify(body));
     const question =
       (body.data && body.data.entity && body.data.entity.message) ||
       body.message ||
@@ -101,8 +99,17 @@ app.post("/ryver", async (req, res) => {
       return;
     }
 
-    // Strip a leading @botname mention if present.
-    const cleaned = question.replace(/^@\S+\s*/, "").trim();
+    // Only respond when Digby is actually addressed (@-mentioned). Keeps the
+    // bot quiet unless spoken to, and ensures every answer is posted publicly
+    // where a human can catch a mistake. (Private DMs intentionally unsupported:
+    // a wrong answer in a private chat is the one nobody catches.)
+    const botHandle = (process.env.BOT_MENTION || "digby").toLowerCase();
+    const mentionRe = new RegExp("@" + botHandle + "\\b", "i");
+    if (!mentionRe.test(question)) {
+      console.log("[ryver] Message did not mention the bot; ignoring.");
+      return;
+    }
+    const cleaned = question.replace(new RegExp("@" + botHandle + "\\s*", "ig"), "").trim();
     console.log(`[ryver] Message: ${cleaned}`);
 
     // --- Intent detection ------------------------------------------------
