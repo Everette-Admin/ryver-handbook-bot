@@ -58,6 +58,23 @@ app.post("/ryver", async (req, res) => {
     return res.status(401).send("unauthorized");
   }
 
+  // 2. Second layer: reject anything that isn't a well-formed Ryver
+  // chat_created payload. Ryver does not sign outbound webhooks (confirmed:
+  // no signing in the Features tab or the outbound/webhook docs), so this
+  // shape check backs up the token against a request that guessed the URL.
+  const vb = req.body || {};
+  const looksLikeRyver =
+    vb.type === "chat_created" &&
+    vb.data &&
+    vb.data.entity &&
+    typeof vb.data.entity.message === "string" &&
+    vb.user &&
+    vb.user.id !== undefined;
+  if (!looksLikeRyver) {
+    console.warn("[ryver] Rejected request: not a valid Ryver chat_created payload.");
+    return res.status(400).send("bad request");
+  }
+
   // Ack immediately so Ryver doesn't time out; we reply asynchronously.
   res.status(200).send("ok");
 
