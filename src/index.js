@@ -3,28 +3,22 @@ import { getHandbookText } from "./drive.js";
 import { chunkText, retrieve } from "./retrieve.js";
 import { answerFromHandbook } from "./answer.js";
 import { scanForConflicts } from "./conflicts.js";
+import { isEditProposal, parseProposal, findSection } from "./propose.js";
 
 const app = express();
 app.use(express.json());
 
 // --- Handbook cache -----------------------------------------------------
-// Re-fetch from Drive at most every CACHE_TTL ms so we're not downloading
-// the file on every single message, but still pick up edits within the day.
 const CACHE_TTL = Number(process.env.CACHE_TTL_MS || 30 * 60 * 1000); // 30 min
 let cache = { chunks: null, text: null, name: null, fetchedAt: 0 };
 
 // --- Duplicate-message guard --------------------------------------------
-// Ryver retries the outbound webhook if the bot is slow to respond (the
-// conflict scan takes several seconds), and each retry would re-run the
-// whole request. We remember message IDs we've already started handling
-// and ignore repeats. Bounded so it can't grow forever.
 const seenMessageIds = new Set();
 const SEEN_MAX = 500;
 function alreadyHandled(id) {
   if (!id) return false;
   if (seenMessageIds.has(id)) return true;
   seenMessageIds.add(id);
-  // Trim oldest entries when the set gets too big.
   if (seenMessageIds.size > SEEN_MAX) {
     const oldest = seenMessageIds.values().next().value;
     seenMessageIds.delete(oldest);
@@ -44,14 +38,19 @@ async function getChunks() {
   return cache;
 }
 
+// Google Docs deep link (doc-level). We keep the handbook's file id here so
+// the Strategy Team message can link straight to the doc.
+function handbookLink() {
+  const id = process.env.HANDBOOK_FILE_ID || "";
+  return id ? `https://docs.google.com/document/d/${id}/edit` : "(handbook link not configured)";
+}
+
 // --- Health check -------------------------------------------------------
 app.get("/", (_req, res) => res.send("Ryver handbook bot is running."));
 
 // --- Ryver outgoing webhook endpoint ------------------------------------
-// Ryver POSTs here when someone messages the bot. We verify a shared token,
-// pull the message text, answer it, and post the reply back.
 app.post("/ryver", async (req, res) => {
-  // 1. Verify the request actually came from your Ryver webhook.
+  // 1. Verify the request came from your Ryver webhook (shared token).
   const token = req.get("x-ryver-token") || req.query.token;
   if (process.env.RYVER_WEBHOOK_TOKEN && token !== process.env.RYVER_WEBHOOK_TOKEN) {
     console.warn("[ryver] Rejected request: bad or missing token.");
@@ -59,9 +58,7 @@ app.post("/ryver", async (req, res) => {
   }
 
   // 2. Second layer: reject anything that isn't a well-formed Ryver
-  // chat_created payload. Ryver does not sign outbound webhooks (confirmed:
-  // no signing in the Features tab or the outbound/webhook docs), so this
-  // shape check backs up the token against a request that guessed the URL.
+  // chat_created payload (Ryver doesn't sign outbound webhooks).
   const vb = req.body || {};
   const looksLikeRyver =
     vb.type === "chat_created" &&
@@ -79,20 +76,11 @@ app.post("/ryver", async (req, res) => {
   res.status(200).send("ok");
 
   try {
-    // Ryver's outgoing webhook payload shape can vary by trigger type.
-    // Pull the message text defensively.
     const body = req.body || {};
     const question =
-      (body.data && body.data.entity && body.data.entity.message) ||
-      body.message ||
-      body.text ||
-      (body.data && (body.data.message || body.data.text)) ||
-      (body.data && body.data.body) ||
-      body.body ||
-      "";
+      (body.data && body.data.entity && body.data.entity.message) || "";
 
-    // Drop duplicate deliveries (Ryver retries slow requests). Keyed on the
-    // message's unique id so a retry of the SAME message is ignored.
+    // Drop duplicate deliveries (Ryver retries slow requests).
     const messageId =
       (body.data && body.data.entity && body.data.entity.id) || "";
     if (alreadyHandled(messageId)) {
@@ -100,10 +88,7 @@ app.post("/ryver", async (req, res) => {
       return;
     }
 
-    // Ignore messages the bot itself posted, or we'll loop forever
-    // (bot posts -> that post fires this webhook -> bot responds again).
-    // Match on the bot's numeric Ryver user ID — stable, unlike a display
-    // name. Digby's ID is 3045971; override via BOT_USER_ID if it changes.
+    // Ignore the bot's own posts (loop guard), matched on numeric user id.
     const botUserId = process.env.BOT_USER_ID || "3045971";
     const senderId = String((body.user && body.user.id) || "");
     if (senderId && senderId === botUserId) {
@@ -116,10 +101,7 @@ app.post("/ryver", async (req, res) => {
       return;
     }
 
-    // Only respond when Digby is actually addressed (@-mentioned). Keeps the
-    // bot quiet unless spoken to, and ensures every answer is posted publicly
-    // where a human can catch a mistake. (Private DMs intentionally unsupported:
-    // a wrong answer in a private chat is the one nobody catches.)
+    // Only respond when Digby is @-mentioned (forum-only; no private DMs).
     const botHandle = (process.env.BOT_MENTION || "digby").toLowerCase();
     const mentionRe = new RegExp("@" + botHandle + "\\b", "i");
     if (!mentionRe.test(question)) {
@@ -129,42 +111,76 @@ app.post("/ryver", async (req, res) => {
     const cleaned = question.replace(new RegExp("@" + botHandle + "\\s*", "ig"), "").trim();
     console.log(`[ryver] Message: ${cleaned}`);
 
-    // --- Intent detection ------------------------------------------------
-    // Conflict scan: a deliberate full-document review, not an everyday
-    // question. Trigger on a conflict word combined with EITHER an action
-    // verb ("scan/check/find for conflicts") OR a reference to the handbook
-    // as a whole ("any conflicts in the handbook?").
+    // Admin allowlist (Ryver user IDs) — used for both conflict scan and
+    // edit proposals.
+    const allowRaw = (process.env.HANDBOOK_ADMIN_IDS || "").trim();
+    const allowlist = allowRaw ? allowRaw.split(",").map((s) => s.trim()) : [];
+    const isAdmin = allowlist.length === 0 || allowlist.includes(senderId);
+
+    // --- Intent: edit proposal ------------------------------------------
+    if (isEditProposal(cleaned)) {
+      // Only the four admins may propose edits.
+      if (!isAdmin) {
+        console.log(`[ryver] Edit proposal denied for user id ${senderId}.`);
+        await postToRyver(
+          "Only the admin team can propose handbook edits. Ask Kevin, Josh, Joe, or Everette to submit it."
+        );
+        return;
+      }
+
+      const parsed = parseProposal(cleaned);
+      if (!parsed) {
+        await postToRyver(
+          'To propose an edit, quote the before and after text, e.g.\n`@digby update: replace "old wording" with "new wording"`'
+        );
+        return;
+      }
+
+      // Confirm in the originating forum.
+      await postToRyver("Requested edit forwarded to the admin team.");
+
+      // Locate the section (best-effort) and build the Strategy Team message.
+      let sectionNote;
+      try {
+        const { text } = await getChunks();
+        const loc = findSection(text, parsed.oldText);
+        if (loc.found && loc.section) sectionNote = `Section: ${loc.section}`;
+        else if (loc.found) sectionNote = "Section: (found in handbook, heading not identified)";
+        else sectionNote = "Section: (exact text not found in handbook — please verify wording)";
+      } catch (e) {
+        sectionNote = "Section: (could not load handbook to locate section)";
+      }
+
+      const requester = (body.user && body.user.__descriptor) || `user ${senderId}`;
+      const strategyMsg =
+        `**Handbook edit requested** by ${requester}\n\n` +
+        `Please replace:\n> ${parsed.oldText}\n\n` +
+        `With:\n> ${parsed.newText}\n\n` +
+        `${sectionNote}\n\n` +
+        `Handbook: ${handbookLink()}\n\n` +
+        `_Reminder: review before applying._`;
+
+      await postToStrategy(strategyMsg);
+      console.log(`[ryver] Edit proposal forwarded to Strategy Team (by ${requester}).`);
+      return;
+    }
+
+    // --- Intent: conflict scan ------------------------------------------
     const mentionsConflict = /\b(conflict|contradict|inconsisten|discrepan)/i.test(cleaned);
     const hasActionVerb = /\b(scan|check|find|review|look|audit)\b/i.test(cleaned);
     const refersToWholeDoc = /\b(handbook|document|policies|whole|entire|anywhere)\b/i.test(cleaned);
-    // Avoid false-positives where "conflict" is the topic of a normal policy
-    // question (e.g. "what's the conflict resolution policy?").
     const isPolicyQuestion = /\bconflict resolution\b/i.test(cleaned);
     const isConflictScan =
       mentionsConflict && !isPolicyQuestion && (hasActionVerb || refersToWholeDoc);
 
     if (isConflictScan) {
-      // Gate behind an allowlist of Ryver user IDs (maintenance tool, not
-      // for every employee). Set HANDBOOK_ADMIN_IDS in Railway to a
-      // comma-separated list of Ryver numeric user IDs (Kevin, Josh, Joe).
-      // NOTE: while HANDBOOK_ADMIN_IDS is empty, the scan is open to anyone
-      // so it can be tested — LOCK THIS DOWN before widening access.
-      const allowRaw = (process.env.HANDBOOK_ADMIN_IDS || "").trim();
-      const allowlist = allowRaw ? allowRaw.split(",").map((s) => s.trim()) : [];
-      const senderId = String(
-        (body.user && body.user.id) ||
-          (body.data && body.data.entity && body.data.entity.__author) ||
-          ""
-      );
-
-      if (allowlist.length > 0 && !allowlist.includes(senderId)) {
+      if (!isAdmin) {
         console.log(`[ryver] Conflict scan denied for user id ${senderId}.`);
         await postToRyver(
-          "Sorry — the conflict scan is limited to handbook admins (Kevin, Josh, or Joe)."
+          "Sorry — the conflict scan is limited to handbook admins (Kevin, Josh, Joe, or Everette)."
         );
         return;
       }
-
       console.log(`[ryver] Running conflict scan (requested by id ${senderId}).`);
       await postToRyver("Scanning the handbook for conflicts — give me a moment...");
       const { text } = await getChunks();
@@ -173,11 +189,10 @@ app.post("/ryver", async (req, res) => {
       return;
     }
 
-    // --- Default: answer the question ------------------------------------
+    // --- Default: answer the question -----------------------------------
     const { chunks } = await getChunks();
     const top = retrieve(cleaned, chunks, 4);
     const answer = await answerFromHandbook(cleaned, top);
-
     await postToRyver(answer);
   } catch (err) {
     console.error("[ryver] Error handling message:", err);
@@ -187,9 +202,7 @@ app.post("/ryver", async (req, res) => {
   }
 });
 
-// --- Post a reply back into Ryver --------------------------------------
-// Uses an INCOMING webhook URL (created in Ryver, points at a specific
-// channel/forum). Set RYVER_INBOUND_URL to that URL.
+// --- Post a reply back into the ORIGINATING forum (Test Team) -----------
 async function postToRyver(text) {
   const url = process.env.RYVER_INBOUND_URL;
   if (!url) {
@@ -206,6 +219,22 @@ async function postToRyver(text) {
   }
 }
 
+// --- Post to the STRATEGY TEAM forum (separate incoming webhook) --------
+async function postToStrategy(text) {
+  const url = process.env.RYVER_STRATEGY_INBOUND_URL;
+  if (!url) {
+    console.warn("[ryver] RYVER_STRATEGY_INBOUND_URL not set; would have posted to Strategy Team:\n" + text);
+    return;
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body: text }),
+  });
+  if (!resp.ok) {
+    console.error(`[ryver] Strategy post failed: ${resp.status} ${await resp.text()}`);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
-
