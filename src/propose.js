@@ -1,67 +1,80 @@
-// Propose-a-change: parse an admin's edit request and locate the section
-// the change affects. The bot NEVER edits the handbook itself — it routes a
-// well-formed request to the Strategy Team forum for a human to action.
-// (Service account stays read-only on the handbook.)
+// Propose-a-change (free-form). An admin describes a desired handbook change
+// in plain language; the bot reads the handbook, finds the current wording,
+// and drafts a before/after proposal for the Strategy Team to review.
+// The bot NEVER edits the handbook itself — service account stays read-only.
+
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // Detect whether a message is an edit proposal. Must START with "update" or
-// "edit" (after the mention has been stripped) so common uses of those words
-// mid-sentence don't trigger it.
+// "edit" (after the mention is stripped) so those words mid-sentence don't
+// trigger it.
 export function isEditProposal(cleaned) {
   return /^(update|edit)\b/i.test(cleaned.trim());
 }
 
-// Parse the before/after text out of the request. Accepts:
-//   replace "OLD" with "NEW"
-//   change "OLD" to "NEW"
-// Quotes can be straight or curly. Returns { old, new } or null if it can't
-// find two quoted strings.
-export function parseProposal(cleaned) {
-  // Grab all quoted spans (straight or curly quotes).
-  const quoted = [...cleaned.matchAll(/[""']([^""']+)[""']/g)].map((m) => m[1]);
-  if (quoted.length >= 2) {
-    return { oldText: quoted[0].trim(), newText: quoted[1].trim() };
-  }
-  return null;
+const SYSTEM_PROMPT = `You help route proposed edits to the Toledo Basement Repair employee handbook. You do NOT edit anything — you produce a clear change proposal for a human reviewer.
+
+You are given (1) the full handbook text and (2) an admin's free-form request to change something. Your job:
+1. Find the CURRENT handbook wording that the request would change. Quote it exactly as it appears.
+2. Draft the NEW wording that reflects what the requester wants, matching the handbook's style.
+3. Identify the section/heading where the change belongs.
+
+Respond ONLY with a JSON object, no markdown, no preamble, in exactly this shape:
+{
+  "found": true or false,
+  "section": "the section name/heading, or null",
+  "current": "the exact current wording to be replaced, or null if not found",
+  "proposed": "the suggested new wording",
+  "note": "a short note for the reviewer"
 }
 
-// Find which section the old text lives in. Splits the handbook into lines,
-// finds the line containing the old text, then walks backward to the nearest
-// heading-looking line. Returns the section label or null if not found.
-export function findSection(handbookText, oldText) {
-  if (!handbookText || !oldText) return { found: false, section: null };
+Rules:
+- If you cannot find current wording that matches the request, set found=false and current=null, but still provide your best "proposed" wording and a "note" explaining the target wasn't located so the reviewer can place it manually.
+- If the request is ambiguous or could apply to multiple places, still pick your best guess but say so in "note".
+- Never invent policy detail beyond what the request states. Keep "proposed" faithful to the request.
+- Output valid JSON only.`;
 
-  const lines = handbookText.split(/\r?\n/);
-  const needle = oldText.toLowerCase();
+// Ask Claude to turn a free-form request into a structured before/after.
+// Returns the parsed object, or a fallback object on error.
+export async function draftProposal(handbookText, requestText) {
+  const userMsg = `Handbook:\n\n${handbookText}\n\n---\n\nAdmin's change request: ${requestText}`;
 
-  let hitLine = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].toLowerCase().includes(needle)) {
-      hitLine = i;
-      break;
-    }
+  try {
+    const resp = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: userMsg }],
+    });
+
+    const rawText = resp.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+      .trim();
+
+    const clean = rawText
+      .replace(/^```json\s*|\s*```$/g, "")
+      .replace(/^```\s*|\s*```$/g, "")
+      .trim();
+    const parsed = JSON.parse(clean);
+    return {
+      found: !!parsed.found,
+      section: parsed.section || null,
+      current: parsed.current || null,
+      proposed: parsed.proposed || "(no proposed wording generated)",
+      note: parsed.note || "",
+    };
+  } catch (err) {
+    console.error("[propose] draftProposal failed:", err);
+    return {
+      found: false,
+      section: null,
+      current: null,
+      proposed: requestText,
+      note: "Could not auto-draft this change (interpretation error). Forwarding the raw request for manual handling.",
+    };
   }
-  if (hitLine === -1) return { found: false, section: null };
-
-  // Walk backward to find the nearest heading. Heuristics for what a heading
-  // looks like in the extracted text: a line starting with "Section",
-  // a numbered heading like "6.10 ...", or a short Title-ish line.
-  for (let i = hitLine; i >= 0 && i > hitLine - 60; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    if (/^section\b/i.test(line) || /^\d+(\.\d+)*\s+\S/.test(line)) {
-      return { found: true, section: line };
-    }
-    // A standalone short line in title case, not ending in a period, is
-    // likely a heading.
-    if (
-      line.length <= 60 &&
-      !line.endsWith(".") &&
-      /^[A-Z]/.test(line) &&
-      line.split(/\s+/).length <= 8
-    ) {
-      return { found: true, section: line };
-    }
-  }
-  // Found the text but couldn't identify a heading above it.
-  return { found: true, section: null };
 }
