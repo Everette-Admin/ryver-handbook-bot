@@ -3,7 +3,7 @@ import { getHandbookText } from "./drive.js";
 import { chunkText, retrieve } from "./retrieve.js";
 import { answerFromHandbook } from "./answer.js";
 import { scanForConflicts } from "./conflicts.js";
-import { isEditProposal, parseProposal, findSection } from "./propose.js";
+import { isEditProposal, draftProposal } from "./propose.js";
 
 const app = express();
 app.use(express.json());
@@ -128,40 +128,55 @@ app.post("/ryver", async (req, res) => {
         return;
       }
 
-      const parsed = parseProposal(cleaned);
-      if (!parsed) {
+      // Strip a leading "update"/"edit" (and optional colon) so the request
+      // text passed to the drafter is just the substance.
+      const requestText = cleaned.replace(/^(update|edit)\b:?\s*/i, "").trim();
+      if (!requestText) {
         await postToRyver(
-          'To propose an edit, quote the before and after text, e.g.\n`@digby update: replace "old wording" with "new wording"`'
+          'Tell me what to change, e.g. `@digby update the working hours to 8-5 M-F`.'
         );
         return;
       }
 
-      // Confirm in the originating forum.
-      await postToRyver("Requested edit forwarded to the admin team.");
+      // Confirm in the originating forum right away (the drafting step takes
+      // a few seconds since it reads the handbook).
+      await postToRyver("Got it — drafting that change for the admin team to review.");
 
-      // Locate the section (best-effort) and build the Strategy Team message.
-      let sectionNote;
+      // Read the handbook and have Claude draft a before/after proposal.
+      let draft;
       try {
         const { text } = await getChunks();
-        const loc = findSection(text, parsed.oldText);
-        if (loc.found && loc.section) sectionNote = `Section: ${loc.section}`;
-        else if (loc.found) sectionNote = "Section: (found in handbook, heading not identified)";
-        else sectionNote = "Section: (exact text not found in handbook — please verify wording)";
+        draft = await draftProposal(text, requestText);
       } catch (e) {
-        sectionNote = "Section: (could not load handbook to locate section)";
+        console.error("[ryver] Proposal drafting error:", e);
+        draft = {
+          found: false,
+          section: null,
+          current: null,
+          proposed: requestText,
+          note: "Could not load the handbook to draft this — forwarding the raw request.",
+        };
       }
 
       const requester = (body.user && body.user.__descriptor) || `user ${senderId}`;
+      const sectionLine = draft.section ? `Section: ${draft.section}` : "Section: (not identified)";
+      const currentBlock = draft.current
+        ? `Current wording:\n> ${draft.current}\n\n`
+        : "Current wording: (not located in handbook — reviewer to place manually)\n\n";
+      const noteLine = draft.note ? `Note: ${draft.note}\n\n` : "";
+
       const strategyMsg =
         `**Handbook edit requested** by ${requester}\n\n` +
-        `Please replace:\n> ${parsed.oldText}\n\n` +
-        `With:\n> ${parsed.newText}\n\n` +
-        `${sectionNote}\n\n` +
+        `Request: ${requestText}\n\n` +
+        currentBlock +
+        `Proposed wording:\n> ${draft.proposed}\n\n` +
+        `${sectionLine}\n\n` +
+        noteLine +
         `Handbook: ${handbookLink()}\n\n` +
-        `_Reminder: review before applying._`;
+        `_Reminder: review before applying. This is an AI-drafted suggestion._`;
 
       await postToStrategy(strategyMsg);
-      console.log(`[ryver] Edit proposal forwarded to Strategy Team (by ${requester}).`);
+      console.log(`[ryver] Edit proposal forwarded to Strategy Team (by ${requester}, found=${draft.found}).`);
       return;
     }
 
